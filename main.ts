@@ -106,7 +106,7 @@ import {
   type Candidate,
 } from './lib/router.ts';
 import { offersAnything, servedModels } from './lib/catalog.ts';
-import { errorTypeFor, shouldFailover, statusWhenExhausted, verdictOf } from './lib/verdict.ts';
+import { errorTypeFor, isPermanent, shouldFailover, statusWhenExhausted, verdictOf } from './lib/verdict.ts';
 import { withDeadline } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
@@ -263,7 +263,11 @@ async function attempt<T>(
       noteServed(health, candidate.probe.provider.id);
       return { ok: true, value: await route(candidate, upstream) as T };
     }
+    // A provider that will not answer again today - a billing hook that fired, a request it will always
+    // refuse - is counted twice so the ranking puts it behind one that merely had a bad moment. Both are
+    // refusals; only one of them is worth coming back to.
     noteRefusal(health, candidate.probe.provider.id);
+    if (isPermanent(verdict)) noteRefusal(health, candidate.probe.provider.id);
     error = `HTTP ${upstream.status}`;
     if (shouldFailover(verdict)) {
       // Drain so the connection is reusable and the refusal is counted, not leaked.
