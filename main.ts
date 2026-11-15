@@ -106,6 +106,7 @@ import {
   wireCarries,
   type Candidate,
 } from './lib/router.ts';
+import { withDeadline } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -291,7 +292,9 @@ async function attempt<T>(
 
 /** POST a body to one candidate's provider, on that provider's own wire. */
 async function callCandidate(candidate: Candidate, body: Json, stream: boolean): Promise<Response> {
-  return callProvider({ probe: candidate.probe, model: candidate.model }, body, stream);
+  // Bounded so a provider that accepts the connection and then stalls cannot hold the whole failover
+  // chain behind it; the abort surfaces as a thrown error, which attempt treats as a refusal.
+  return withDeadline((signal) => callProvider({ probe: candidate.probe, model: candidate.model }, body, stream, signal));
 }
 
 /**
@@ -306,7 +309,7 @@ async function callCandidate(candidate: Candidate, body: Json, stream: boolean):
  * carry the flag, and reading it off the translated record silently asked a gemini-wire provider for a
  * whole answer while the caller had opened an event stream.
  */
-async function callProvider(route: Route, body: Json, stream: boolean): Promise<Response> {
+async function callProvider(route: Route, body: Json, stream: boolean, signal: AbortSignal): Promise<Response> {
   const provider = route.probe.provider;
   const base = joinBase(ENV_URL, mountOf(provider));
   const headers: Record<string, string> = {
@@ -316,7 +319,7 @@ async function callProvider(route: Route, body: Json, stream: boolean): Promise<
   if (provider.wire === 'anthropic') {
     headers['anthropic-version'] = '2023-06-01';
     if (stream) headers.accept = 'text/event-stream';
-    return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body) });
+    return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body), signal });
   }
   if (provider.wire === 'gemini') {
     const action = stream ? 'streamGenerateContent' : 'generateContent';
@@ -325,10 +328,11 @@ async function callProvider(route: Route, body: Json, stream: boolean): Promise<
       method: 'POST',
       headers,
       body: JSON.stringify(body),
+      signal,
     });
   }
   if (stream) headers.accept = 'text/event-stream';
-  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
+  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
 }
 
 /** Copy a provider's stream to the client as it arrives, whether raw bytes or generated frames. */
