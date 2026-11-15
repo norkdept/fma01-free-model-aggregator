@@ -91,6 +91,13 @@ import {
   openAIEventsFromOpenAI,
 } from './lib/dispatch.ts';
 import {
+  describeBodyFailure,
+  readBody,
+  requestedMaxTokens,
+  statusForBodyFailure,
+  type JsonObject,
+} from './lib/http.ts';
+import {
   freshHealth,
   isRefusal,
   noteRefusal,
@@ -194,22 +201,20 @@ function requirementsFromBody(body: Json): Requirement {
 }
 
 /** One client request body, or null when it is not one JSON object or is too large. */
-async function readJson(req: IncomingMessage): Promise<Json | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    size += buffer.length;
-    if (size > MAX_BODY_BYTES) return null;
-    chunks.push(buffer);
-  }
-  if (chunks.length === 0) return null;
-  try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
-  }
+/**
+ * Read and validate the body, answering the client itself when it cannot be used.
+ *
+ * Returns the parsed object, or null once the refusal has been sent; the caller only has to return.
+ */
+async function bodyOrRefuse(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<JsonObject | null> {
+  const { result, bytes } = await readBody(req, MAX_BODY_BYTES);
+  if (result.ok) return result.body;
+  const status = statusForBodyFailure(result.reason);
+  // Over the cap, the read stopped buffering but the client kept writing; close rather than keep the
+  // connection, since the rest of the body was never consumed.
+  if (result.reason === 'too_large') res.setHeader('connection', 'close');
+  sendError(res, wire, status, 'invalid_request_error', `${describeBodyFailure(result.reason, MAX_BODY_BYTES)} (${bytes} bytes read)`);
+  return null;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -351,8 +356,8 @@ async function pipeStream(
 
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered over whichever provider wire wins. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const body = await bodyOrRefuse(req, res, 'openai');
+  if (body === null) return;
   const requires = requirementsFor(body);
   const candidates = rankFor(requires);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
@@ -391,8 +396,11 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
 /** POST /v1/messages: an Anthropic-shaped client, answered over whichever provider wire wins. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const body = await bodyOrRefuse(req, res, 'anthropic');
+  if (body === null) return;
+  // The Messages API requires a positive max_tokens; a request without one is malformed rather than
+  // merely unusual, and answering it here keeps the refusal in the client's own dialect.
+  if (requestedMaxTokens(body) === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'max_tokens is required and must be a positive integer');
   const requires = requirementsFor(body);
   const candidates = rankFor(requires);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
