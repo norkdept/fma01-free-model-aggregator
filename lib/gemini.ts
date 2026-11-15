@@ -49,22 +49,68 @@ function systemOf(messages: readonly Json_[]): string {
 
 /** Chat Completions messages -> gemini contents, keeping order and merging consecutive same-role turns. */
 function contentsOf(messages: readonly Json_[]): unknown[] {
-  const contents: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+  const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
   for (const message of messages) {
     const role = typeof message.role === 'string' ? message.role : 'user';
     if (role === 'system' || role === 'developer') continue;
     const content = message.content;
-    let text = '';
-    if (typeof content === 'string') text = content;
-    else if (Array.isArray(content)) text = textOfParts(content);
-    if (text === '') continue;
+    const parts: Array<Record<string, unknown>> = [];
+    if (typeof content === 'string') {
+      if (content !== '') parts.push({ text: content });
+    } else if (Array.isArray(content)) {
+      // Keep images: dropping them makes the provider echo a request the client never sent.
+      for (const part of content) {
+        const record = asRecord(part);
+        if (record === null) continue;
+        if (record.type === 'text' && typeof record.text === 'string') parts.push({ text: record.text });
+        else if (record.type === 'image_url') {
+          const image = asRecord(record.image_url);
+          const url = image !== null && typeof image.url === 'string' ? image.url : null;
+          const loaded = url === null ? null : inlineImageOf(url);
+          if (loaded !== null) parts.push({ inlineData: loaded });
+        }
+      }
+    }
+    if (parts.length === 0) continue;
     // Gemini accepts only user and model, and rejects two turns of the same role in a row.
     const geminiRole = role === 'assistant' ? 'model' : 'user';
     const last = contents[contents.length - 1];
-    if (last !== undefined && last.role === geminiRole) last.parts[0].text += `\n\n${text}`;
-    else contents.push({ role: geminiRole, parts: [{ text }] });
+    if (last !== undefined && last.role === geminiRole) last.parts.push(...parts);
+    else contents.push({ role: geminiRole, parts });
   }
   return contents;
+}
+
+/** A data: URL as gemini's inlineData; a remote URL is not fetched, since a trial may not reach it. */
+function inlineImageOf(url: string): { mimeType: string; data: string } | null {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (match === null) return null;
+  return { mimeType: match[1], data: match[2] };
+}
+
+/** OpenAI function tools -> gemini functionDeclarations, one block for all of them. */
+function toolsOf(body: Json_): unknown[] | null {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const declarations: Array<Record<string, unknown>> = [];
+  for (const tool of tools) {
+    const record = asRecord(tool);
+    if (record === null || record.type !== 'function') continue;
+    const fn = asRecord(record.function);
+    if (fn === null || typeof fn.name !== 'string') continue;
+    const declaration: Record<string, unknown> = { name: fn.name };
+    if (typeof fn.description === 'string') declaration.description = fn.description;
+    const parameters = asRecord(fn.parameters);
+    if (parameters !== null) declaration.parameters = parameters;
+    declarations.push(declaration);
+  }
+  if (declarations.length === 0) return null;
+  const block: Record<string, unknown> = { functionDeclarations: declarations };
+  const choice = body.tool_choice;
+  if (typeof choice === 'string' && choice !== 'auto') {
+    // gemini's mode is a config knob, not a per-tool field
+    block.toolConfig = { functionCallingConfig: { mode: choice === 'none' ? 'NONE' : 'ANY' } };
+  }
+  return [block];
 }
 
 /** Map the OpenAI generation knobs onto gemini's generationConfig. */
@@ -91,12 +137,15 @@ function generationConfigOf(body: Json_): Json | null {
 /** A Chat-Completions body re-expressed for generateContent. The model is NOT set here; it is in the URL. */
 export function openAIToGemini(body: Json): Json {
   const record = asRecord(body) ?? {};
+  if (process.env.FMA_DEBUG === '1') console.error('GEMINI-REQ-IN tools=' + JSON.stringify(record.tools) + ' keys=' + Object.keys(record).join(','));
   const messages = Array.isArray(record.messages) ? record.messages.map((m) => asRecord(m) ?? {}) : [];
   const request: Record<string, unknown> = { contents: contentsOf(messages) };
   const system = systemOf(messages);
   if (system !== '') request.systemInstruction = { parts: [{ text: system }] };
   const config = generationConfigOf(record);
   if (config !== null) request.generationConfig = config;
+  const tools = toolsOf(record);
+  if (tools !== null) request.tools = tools;
   return request as Json;
 }
 

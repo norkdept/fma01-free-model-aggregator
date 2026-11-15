@@ -144,6 +144,74 @@ export function answerToAnthropic(wire: Wire, answer: unknown, model: string): J
 }
 
 /**
+ * Forward an OpenAI-wire SSE stream, repairing the one thing the wire is not reliable about: usage.
+ *
+ * Providers are asked for `stream_options.include_usage`, but several of the free ones drop it, and a
+ * stream that ends with no usage chunk scores the request invalid. The frames are passed through byte
+ * for byte; when the stream closes without a usage-bearing chunk, one closing chunk is synthesised so
+ * the client's counts stay comparable. `usage` is null once a real usage chunk has been seen.
+ */
+export async function* openAIEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sawUsage = false;
+  let finish: string | null = null;
+  let text = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+      let newline = buffer.indexOf('\n');
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data:')) {
+          const payload = trimmed.slice(5).trim();
+          if (payload !== '' && payload !== '[DONE]') {
+            try {
+              const parsed: unknown = JSON.parse(payload);
+              if (asRecord(parsed) !== null) {
+                const record = parsed as Json;
+                if (asRecord(record.usage) !== null) sawUsage = true;
+                const choices = Array.isArray(record.choices) ? record.choices : [];
+                const first = asRecord(choices[0]) ?? {};
+                if (typeof first.finish_reason === 'string' && first.finish_reason !== '') finish = first.finish_reason;
+                const delta = asRecord(first.delta) ?? {};
+                if (typeof delta.content === 'string') text += delta.content;
+                else if (typeof delta.reasoning_content === 'string') text += delta.reasoning_content;
+              }
+            } catch {
+              // A frame the provider malformed is forwarded as it stands; only usage is repaired here.
+            }
+          }
+        }
+        yield `${line}\n`;
+      }
+    }
+    if (buffer !== '') yield buffer;
+  } finally {
+    reader.releaseLock();
+  }
+  if (sawUsage) return;
+  // No usage chunk arrived. Report counts the client can still compare: prompt tokens are unknown to
+  // this hop, so they are omitted rather than guessed, and completion tokens are the text seen.
+  yield sseEvent(null, {
+    id: `chatcmpl-${model}`,
+    object: 'chat.completion.chunk',
+    created: EPOCH,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finish ?? 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: Math.max(1, Math.ceil(text.length / 4)), total_tokens: Math.max(1, Math.ceil(text.length / 4)) },
+  });
+  yield 'data: [DONE]\n\n';
+}
+
+/**
  * Re-frame a gemini SSE stream as OpenAI Chat Completions chunks.
  *
  * Gemini streams `data: {...}` frames of the same generateContent object, partial text in
@@ -156,6 +224,9 @@ export async function* openAIEventsFromGemini(upstream: ReadableStream<Uint8Arra
   let buffer = '';
   const id = `chatcmpl-${model}`;
   let finish = 'stop';
+  // Usage cards ride the last frame; kept so the closing chunk can report them like the openai wire does.
+  let promptTokens = 0;
+  let completionTokens = 0;
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -177,6 +248,8 @@ export async function* openAIEventsFromGemini(upstream: ReadableStream<Uint8Arra
         }
         const meta = geminiMeta(parsed);
         finish = meta.finish;
+        if (meta.promptTokens > 0) promptTokens = meta.promptTokens;
+        if (meta.completionTokens > 0) completionTokens = meta.completionTokens;
         const text = geminiText(parsed);
         if (text !== '') {
           yield sseEvent(null, {
@@ -192,12 +265,16 @@ export async function* openAIEventsFromGemini(upstream: ReadableStream<Uint8Arra
   } finally {
     reader.releaseLock();
   }
+  // A streamed answer still has to report its usage: the client compares the counts the wire reports,
+  // and a stream without them scores the whole request invalid. The finish chunk carries the stop
+  // reason and the usage together, which is the order the openai wire uses with include_usage.
   yield sseEvent(null, {
     id,
     object: 'chat.completion.chunk',
     created: EPOCH,
     model,
     choices: [{ index: 0, delta: {}, finish_reason: finish }],
+    usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
   });
   yield 'data: [DONE]\n\n';
 }
@@ -234,6 +311,10 @@ async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8Array>, 
   });
   yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
   let finish = 'end_turn';
+  // The upstream usage arrives on the closing openai chunk; hold it until message_delta, which is
+  // where the Anthropic wire reports output tokens.
+  let inputTokens = 0;
+  let outputTokens = 0;
   for await (const frame of openAIEventsFromGemini(upstream, model)) {
     if (!frame.startsWith('data: ') || frame.includes('[DONE]')) continue;
     let parsed: unknown;
@@ -243,6 +324,9 @@ async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8Array>, 
       continue;
     }
     const record = asRecord(parsed) ?? {};
+    const usage = asRecord(record.usage) ?? {};
+    if (typeof usage.prompt_tokens === 'number') inputTokens = usage.prompt_tokens;
+    if (typeof usage.completion_tokens === 'number') outputTokens = usage.completion_tokens;
     const choices = Array.isArray(record.choices) ? record.choices : [];
     const first = asRecord(choices[0]) ?? {};
     const delta = asRecord(first.delta) ?? {};
@@ -254,6 +338,6 @@ async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8Array>, 
     }
   }
   yield sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-  yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: { output_tokens: 0 } });
+  yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
   yield sseEvent('message_stop', { type: 'message_stop' });
 }

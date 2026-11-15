@@ -87,6 +87,7 @@ import {
   answerToOpenAI,
   openAIBodyFor,
   openAIEventsFromGemini,
+  openAIEventsFromOpenAI,
 } from './lib/dispatch.ts';
 import {
   freshHealth,
@@ -355,7 +356,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (body.stream === true) {
       if (upstream.body === null) return null;
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      const events = wire === 'openai' ? upstream.body : openAIEventsFromGemini(upstream.body, candidate.model.id);
+      // The OpenAI-wire stream still goes through a normaliser: the provider was asked for usage but
+      // several free ones drop it, and a stream with no usage chunk scores the request invalid.
+      const events = wire === 'openai' ? openAIEventsFromOpenAI(upstream.body, candidate.model.id) : openAIEventsFromGemini(upstream.body, candidate.model.id);
       await pipeStream(events, res);
       return '';
     }
