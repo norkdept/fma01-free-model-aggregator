@@ -106,7 +106,7 @@ import {
   type Candidate,
 } from './lib/router.ts';
 import { offersAnything, servedModels } from './lib/catalog.ts';
-import { shouldFailover, verdictOf } from './lib/verdict.ts';
+import { errorTypeFor, shouldFailover, statusWhenExhausted, verdictOf } from './lib/verdict.ts';
 import { withDeadline } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
@@ -382,7 +382,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     else res.end();
     return;
   }
-  if (!res.headersSent) sendError(res, 'openai', 502, 'upstream_unreachable', outcome.error ?? 'no provider answered');
+  // Nothing was reached at all: no provider status to forward, so report the walk's own failure rather
+  // than inventing one, and name the reason instead of echoing a bare 502.
+  if (!res.headersSent) sendError(res, 'openai', statusWhenExhausted(null), errorTypeFor(verdictOf(null)), outcome.error ?? 'no provider answered');
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, answered over whichever provider wire wins. */
