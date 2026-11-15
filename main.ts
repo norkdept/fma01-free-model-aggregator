@@ -86,6 +86,7 @@ import {
   answerToAnthropic,
   answerToOpenAI,
   openAIBodyFor,
+  openAIEventsFromAnthropic,
   openAIEventsFromGemini,
   openAIEventsFromOpenAI,
 } from './lib/dispatch.ts';
@@ -245,6 +246,7 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 async function attempt<T>(
   candidates: Candidate[],
   requires: Requirement,
+  wantsStream: boolean,
   build: (candidate: Candidate) => Json,
   route: (candidate: Candidate, upstream: Response) => Promise<T | null>,
 ): Promise<{ ok: true; value: T } | { ok: false; last: Response | null; error: string | null }> {
@@ -254,7 +256,7 @@ async function attempt<T>(
     if (!wireCarries(candidate, requires, ratingOfModel(brief.ratings, candidate.probe.provider.id, candidate.model.id))) continue;
     let upstream: Response;
     try {
-      upstream = await callCandidate(candidate, build(candidate));
+      upstream = await callCandidate(candidate, build(candidate), wantsStream);
     } catch (err) {
       // A network fault is the provider's failure to serve, not the request's: count it and move on.
       noteRefusal(health, candidate.probe.provider.id);
@@ -283,8 +285,8 @@ async function attempt<T>(
 }
 
 /** POST a body to one candidate's provider, on that provider's own wire. */
-async function callCandidate(candidate: Candidate, body: Json): Promise<Response> {
-  return callProvider({ probe: candidate.probe, model: candidate.model }, body);
+async function callCandidate(candidate: Candidate, body: Json, stream: boolean): Promise<Response> {
+  return callProvider({ probe: candidate.probe, model: candidate.model }, body, stream);
 }
 
 /**
@@ -294,8 +296,12 @@ async function callCandidate(candidate: Candidate, body: Json): Promise<Response
  * POSTs /v1/messages with its version header, gemini POSTs /v1beta/models/<model>:generateContent
  * with the model in the path. Getting this wrong is the whole wire column (10%) and most of the
  * served column: the baseline answered 501 for every non-openai provider.
+ *
+ * `stream` is passed separately from the body: a translated body (generateContent, Messages) need not
+ * carry the flag, and reading it off the translated record silently asked a gemini-wire provider for a
+ * whole answer while the caller had opened an event stream.
  */
-async function callProvider(route: Route, body: Json): Promise<Response> {
+async function callProvider(route: Route, body: Json, stream: boolean): Promise<Response> {
   const provider = route.probe.provider;
   const base = joinBase(ENV_URL, mountOf(provider));
   const headers: Record<string, string> = {
@@ -304,19 +310,19 @@ async function callProvider(route: Route, body: Json): Promise<Response> {
   };
   if (provider.wire === 'anthropic') {
     headers['anthropic-version'] = '2023-06-01';
-    if (body.stream === true) headers.accept = 'text/event-stream';
+    if (stream) headers.accept = 'text/event-stream';
     return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body) });
   }
   if (provider.wire === 'gemini') {
-    const action = body.stream === true ? 'streamGenerateContent' : 'generateContent';
-    const query = body.stream === true ? '?alt=sse' : '';
+    const action = stream ? 'streamGenerateContent' : 'generateContent';
+    const query = stream ? '?alt=sse' : '';
     return fetch(`${base}/v1beta/models/${encodeURIComponent(route.model.id)}:${action}${query}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
     });
   }
-  if (body.stream === true) headers.accept = 'text/event-stream';
+  if (stream) headers.accept = 'text/event-stream';
   return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
 }
 
@@ -351,14 +357,19 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const candidates = rankFor(requires);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   // The OpenAI client speaks the OpenAI wire, so an anthropic- or gemini-wire provider is bridged.
-  const outcome = await attempt<string | null>(candidates, requires, (candidate) => openAIBodyFor(candidate.probe.provider.wire, body, candidate.model.id), async (candidate, upstream) => {
+  const outcome = await attempt<string | null>(candidates, requires, body.stream === true, (candidate) => openAIBodyFor(candidate.probe.provider.wire, body, candidate.model.id), async (candidate, upstream) => {
     const wire = candidate.probe.provider.wire;
     if (body.stream === true) {
       if (upstream.body === null) return null;
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       // The OpenAI-wire stream still goes through a normaliser: the provider was asked for usage but
       // several free ones drop it, and a stream with no usage chunk scores the request invalid.
-      const events = wire === 'openai' ? openAIEventsFromOpenAI(upstream.body, candidate.model.id) : openAIEventsFromGemini(upstream.body, candidate.model.id);
+      const events =
+        wire === 'openai'
+          ? openAIEventsFromOpenAI(upstream.body, candidate.model.id)
+          : wire === 'anthropic'
+            ? openAIEventsFromAnthropic(upstream.body, candidate.model.id)
+            : openAIEventsFromGemini(upstream.body, candidate.model.id);
       await pipeStream(events, res);
       return '';
     }
@@ -386,7 +397,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const candidates = rankFor(requires);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : 'auto';
-  const outcome = await attempt<string | null>(candidates, requires, (candidate) => anthropicBodyFor(candidate.probe.provider.wire, body, candidate.model.id), async (candidate, upstream) => {
+  const outcome = await attempt<string | null>(candidates, requires, body.stream === true, (candidate) => anthropicBodyFor(candidate.probe.provider.wire, body, candidate.model.id), async (candidate, upstream) => {
     const wire = candidate.probe.provider.wire;
     if (body.stream === true) {
       if (upstream.body === null) return null;

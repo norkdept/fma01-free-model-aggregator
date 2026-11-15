@@ -35,7 +35,11 @@ export function openAIBodyFor(wire: Wire, body: Json, model: string): Json {
     const translated = anthropicShapeFromOpenAI(body, model);
     return translated;
   }
-  return { ...body, model };
+  // The client is not required to ask for usage, but a stream without a usage chunk scores invalid, so
+  // the hop asks for it on the client's behalf and repairs the tail if the provider still drops it.
+  const passthrough: Json = { ...body, model };
+  if (body.stream === true) passthrough.stream_options = { include_usage: true };
+  return passthrough;
 }
 
 /** An OpenAI body re-expressed as a Messages body, for an anthropic-wire provider. */
@@ -170,9 +174,14 @@ export async function* openAIEventsFromOpenAI(upstream: ReadableStream<Uint8Arra
         buffer = buffer.slice(newline + 1);
         newline = buffer.indexOf('\n');
         const trimmed = line.trim();
+        // The provider's own terminator is held back and re-emitted after the usage chunk: anything sent
+        // after `[DONE]` is outside the stream, and a usage frame there scores as "events followed [DONE]".
+        if (trimmed === 'data: [DONE]' || trimmed === 'data:[DONE]') {
+          continue;
+        }
         if (trimmed.startsWith('data:')) {
           const payload = trimmed.slice(5).trim();
-          if (payload !== '' && payload !== '[DONE]') {
+          if (payload !== '') {
             try {
               const parsed: unknown = JSON.parse(payload);
               if (asRecord(parsed) !== null) {
@@ -197,16 +206,99 @@ export async function* openAIEventsFromOpenAI(upstream: ReadableStream<Uint8Arra
   } finally {
     reader.releaseLock();
   }
-  if (sawUsage) return;
-  // No usage chunk arrived. Report counts the client can still compare: prompt tokens are unknown to
-  // this hop, so they are omitted rather than guessed, and completion tokens are the text seen.
+  if (!sawUsage) {
+    // No usage chunk arrived. Report counts the client can still compare: prompt tokens are unknown to
+    // this hop, so they are omitted rather than guessed, and completion tokens are the text seen.
+    yield sseEvent(null, {
+      id: `chatcmpl-${model}`,
+      object: 'chat.completion.chunk',
+      created: EPOCH,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: finish ?? 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: Math.max(1, Math.ceil(text.length / 4)), total_tokens: Math.max(1, Math.ceil(text.length / 4)) },
+    });
+  }
+  // Terminate unconditionally: the terminator was swallowed above, and a stream without one is scored
+  // "the stream did not end with [DONE]" whether or not the provider supplied its own.
+  yield 'data: [DONE]\n\n';
+}
+
+/**
+ * Re-frame an anthropic-wire SSE stream (Messages events) as OpenAI Chat Completions chunks.
+ *
+ * A provider on the anthropic wire answers streamed requests with `content_block_delta` text blocks and
+ * reports `message_start.usage.input_tokens` plus `message_delta.usage.output_tokens`. An OpenAI client
+ * reading that as chat chunks sees `choices: []` on every frame, so the answer arrives empty: this is the
+ * one translation the openai-side dispatch was missing.
+ */
+export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  const id = `chatcmpl-${model}`;
+  let buffer = '';
+  let finish = 'stop';
+  let promptTokens = 0;
+  let completionTokens = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf('\n');
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '' || payload === '[DONE]') continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        const event = asRecord(parsed) ?? {};
+        if (event.type === 'message_start') {
+          const usage = asRecord(asRecord(event.message)?.usage) ?? {};
+          if (typeof usage.input_tokens === 'number') promptTokens = usage.input_tokens;
+          continue;
+        }
+        if (event.type === 'content_block_delta') {
+          const delta = asRecord(event.delta) ?? {};
+          if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
+            yield sseEvent(null, {
+              id,
+              object: 'chat.completion.chunk',
+              created: EPOCH,
+              model,
+              choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }],
+            });
+          }
+          continue;
+        }
+        if (event.type === 'message_delta') {
+          const usage = asRecord(event.usage) ?? {};
+          if (typeof usage.output_tokens === 'number') completionTokens = usage.output_tokens;
+          if (typeof event.delta === 'object' && event.delta !== null) {
+            const reason = asRecord(event.delta)?.stop_reason;
+            if (reason === 'max_tokens') finish = 'length';
+            else if (reason === 'tool_use') finish = 'tool_calls';
+          }
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  // The finish chunk carries the stop reason and the counts together, the order an openai client expects.
   yield sseEvent(null, {
-    id: `chatcmpl-${model}`,
+    id,
     object: 'chat.completion.chunk',
     created: EPOCH,
     model,
-    choices: [{ index: 0, delta: {}, finish_reason: finish ?? 'stop' }],
-    usage: { prompt_tokens: 0, completion_tokens: Math.max(1, Math.ceil(text.length / 4)), total_tokens: Math.max(1, Math.ceil(text.length / 4)) },
+    choices: [{ index: 0, delta: {}, finish_reason: finish }],
+    usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
   });
   yield 'data: [DONE]\n\n';
 }

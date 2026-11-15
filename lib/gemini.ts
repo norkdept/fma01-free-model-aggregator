@@ -137,7 +137,6 @@ function generationConfigOf(body: Json_): Json | null {
 /** A Chat-Completions body re-expressed for generateContent. The model is NOT set here; it is in the URL. */
 export function openAIToGemini(body: Json): Json {
   const record = asRecord(body) ?? {};
-  if (process.env.FMA_DEBUG === '1') console.error('GEMINI-REQ-IN tools=' + JSON.stringify(record.tools) + ' keys=' + Object.keys(record).join(','));
   const messages = Array.isArray(record.messages) ? record.messages.map((m) => asRecord(m) ?? {}) : [];
   const request: Record<string, unknown> = { contents: contentsOf(messages) };
   const system = systemOf(messages);
