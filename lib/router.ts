@@ -62,8 +62,19 @@ export function noteRefusal(health: Health, providerId: string): void {
   bump(health.refusals, providerId);
 }
 
+/**
+ * Record a success, giving back one refusal.
+ *
+ * Refusals only ever grew, so a provider that refused once and then served a hundred requests stayed
+ * ranked behind one that had never refused at all - the count recorded history rather than standing.
+ * A success now pays back a single refusal, which is what "recovered" means here; the walk still
+ * remembers that the provider can fail, because the count floor is zero and the next refusal counts
+ * again. Without this the ranking slowly freezes into its first impression of each provider.
+ */
 export function noteServed(health: Health, providerId: string): void {
   bump(health.served, providerId);
+  const prior = health.refusals.get(providerId) ?? 0;
+  if (prior > 0) health.refusals.set(providerId, prior - 1);
 }
 
 /**
