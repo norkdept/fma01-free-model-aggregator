@@ -99,7 +99,6 @@ import {
 } from './lib/http.ts';
 import {
   freshHealth,
-  isRefusal,
   noteRefusal,
   noteServed,
   rankCandidates,
@@ -107,6 +106,7 @@ import {
   type Candidate,
 } from './lib/router.ts';
 import { offersAnything, servedModels } from './lib/catalog.ts';
+import { shouldFailover, verdictOf } from './lib/verdict.ts';
 import { withDeadline } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
@@ -258,21 +258,20 @@ async function attempt<T>(
       continue;
     }
     last = upstream;
-    if (upstream.ok) {
+    const verdict = verdictOf(upstream.status);
+    if (verdict === 'served') {
       noteServed(health, candidate.probe.provider.id);
       return { ok: true, value: await route(candidate, upstream) as T };
     }
-    if (isRefusal(upstream.status)) {
-      // Drain the body so the connection is reusable and the refusal is counted, not leaked.
+    noteRefusal(health, candidate.probe.provider.id);
+    error = `HTTP ${upstream.status}`;
+    if (shouldFailover(verdict)) {
+      // Drain so the connection is reusable and the refusal is counted, not leaked.
       await upstream.text().catch(() => '');
-      noteRefusal(health, candidate.probe.provider.id);
-      error = `HTTP ${upstream.status}`;
       continue;
     }
     // A 4xx that is not a refusal is the request's own fault (a bad field): another provider will
     // refuse it the same way, so answer with what the provider said.
-    noteRefusal(health, candidate.probe.provider.id);
-    error = `HTTP ${upstream.status}`;
     return { ok: false, last, error };
   }
   return { ok: false, last, error };
