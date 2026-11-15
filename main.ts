@@ -106,6 +106,7 @@ import {
   wireCarries,
   type Candidate,
 } from './lib/router.ts';
+import { offersAnything, servedModels } from './lib/catalog.ts';
 import { withDeadline } from './lib/retry.ts';
 
 /** The wire protocol's version, in the register body. */
@@ -138,22 +139,6 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
-}
-
-const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-
-/** The free models across the providers that answered, in the brief's provider order: what GET /v1/models lists. */
-function servedModels(): ServedModel[] {
-  const out: ServedModel[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
-    }
-  }
-  return out;
 }
 
 interface Route {
@@ -231,7 +216,10 @@ function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: nu
 
 /** GET /v1/models, in the shape of the auth header the client sent. */
 function models(req: IncomingMessage, res: ServerResponse): void {
-  const list = servedModels();
+  const list = servedModels(probes, brief.ratings);
+  // A listing that answers 200 with nothing in it reads as "connected, no models" when the truth is
+  // "every provider refused"; the client's retry logic treats those two very differently.
+  if (!offersAnything(list)) return sendError(res, typeof req.headers['x-api-key'] === 'string' ? 'anthropic' : 'openai', 503, 'no_free_model', 'no answered provider offers a free model');
   if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
   else sendJson(res, 200, openAIModelList(list));
 }
@@ -517,7 +505,7 @@ async function start(): Promise<void> {
   const port = address.port;
   // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models`);
+  log(`listening on 0.0.0.0:${port} with ${catalog.providers.filter((p) => p.models.length > 0).length} answered providers and ${catalog.providers.reduce((n, p) => n + p.models.length, 0)} free models`);
   await register(port, catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
