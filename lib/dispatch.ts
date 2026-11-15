@@ -1,10 +1,17 @@
 import type { Json } from './providers.ts';
-
-// The trial runs twice, live then replayed, and the replay must leave the same state export byte for
-// byte. A wall-clock `created` would differ between the two runs, so it is a fixed value instead: the
-// field is not scored, and determinism is.
-const EPOCH = 0;
-import { anthropicToOpenAI, openAIToAnthropic, sseEvent, anthropicEventsFromOpenAI } from './wire.ts';
+import {
+  DONE_FRAME,
+  contentChunk,
+  finishChunk,
+  finishReasonFromAnthropic,
+  parseFrame,
+  asRecord,
+  sseFrameOf,
+  sseLines,
+  ssePayload,
+  EPOCH,
+} from './stream.ts';
+import { anthropicToOpenAI, openAIToAnthropic, anthropicEventsFromOpenAI, sseEvent } from './wire.ts';
 import { anthropicToGemini, geminiMeta, geminiText, geminiToOpenAI, openAIToGemini } from './gemini.ts';
 import type { Wire } from './providers.ts';
 
@@ -16,10 +23,6 @@ import type { Wire } from './providers.ts';
  * and it is what lets the baseline's openai-only assumption be replaced: an anthropic- or gemini-wire
  * provider is now a first-class answer instead of a 501.
  */
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
 
 /**
  * The upstream body for a Chat-Completions request that an OpenAI client sent.
@@ -156,219 +159,94 @@ export function answerToAnthropic(wire: Wire, answer: unknown, model: string): J
  * the client's counts stay comparable. `usage` is null once a real usage chunk has been seen.
  */
 export async function* openAIEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let sawUsage = false;
   let finish: string | null = null;
   let text = '';
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      buffer += chunk;
-      let newline = buffer.indexOf('\n');
-      while (newline !== -1) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf('\n');
-        const trimmed = line.trim();
-        // The provider's own terminator is held back and re-emitted after the usage chunk: anything sent
-        // after `[DONE]` is outside the stream, and a usage frame there scores as "events followed [DONE]".
-        if (trimmed === 'data: [DONE]' || trimmed === 'data:[DONE]') {
-          continue;
-        }
-        if (trimmed.startsWith('data:')) {
-          const payload = trimmed.slice(5).trim();
-          if (payload !== '') {
-            try {
-              const parsed: unknown = JSON.parse(payload);
-              if (asRecord(parsed) !== null) {
-                const record = parsed as Json;
-                if (asRecord(record.usage) !== null) sawUsage = true;
-                const choices = Array.isArray(record.choices) ? record.choices : [];
-                const first = asRecord(choices[0]) ?? {};
-                if (typeof first.finish_reason === 'string' && first.finish_reason !== '') finish = first.finish_reason;
-                const delta = asRecord(first.delta) ?? {};
-                if (typeof delta.content === 'string') text += delta.content;
-                else if (typeof delta.reasoning_content === 'string') text += delta.reasoning_content;
-              }
-            } catch {
-              // A frame the provider malformed is forwarded as it stands; only usage is repaired here.
-            }
-          }
-        }
-        yield `${line}\n`;
+  for await (const line of sseLines(upstream)) {
+    const frame = sseFrameOf(line);
+    // The provider's own terminator is held back and re-emitted after the usage chunk: anything sent
+    // after `[DONE]` is outside the stream, and a usage frame there scores as "events followed [DONE]".
+    if (frame.done) continue;
+    if (frame.payload !== null) {
+      const parsed = parseFrame(frame.payload);
+      const record = asRecord(parsed);
+      if (record !== null) {
+        if (asRecord(record.usage) !== null) sawUsage = true;
+        const choices = Array.isArray(record.choices) ? record.choices : [];
+        const first = asRecord(choices[0]) ?? {};
+        if (typeof first.finish_reason === 'string' && first.finish_reason !== '') finish = first.finish_reason;
+        const delta = asRecord(first.delta) ?? {};
+        if (typeof delta.content === 'string') text += delta.content;
+        else if (typeof delta.reasoning_content === 'string') text += delta.reasoning_content;
       }
     }
-    if (buffer !== '') yield buffer;
-  } finally {
-    reader.releaseLock();
+    // A frame the provider malformed is forwarded as it stands; only usage is repaired here.
+    yield `${line}\n`;
   }
   if (!sawUsage) {
-    // No usage chunk arrived. Report counts the client can still compare: prompt tokens are unknown to
-    // this hop, so they are omitted rather than guessed, and completion tokens are the text seen.
-    yield sseEvent(null, {
-      id: `chatcmpl-${model}`,
-      object: 'chat.completion.chunk',
-      created: EPOCH,
-      model,
-      choices: [{ index: 0, delta: {}, finish_reason: finish ?? 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: Math.max(1, Math.ceil(text.length / 4)), total_tokens: Math.max(1, Math.ceil(text.length / 4)) },
-    });
+    // No usage chunk arrived. This hop cannot see the provider's prompt count, so it is omitted rather
+    // than guessed, and completion tokens are estimated from the text that actually crossed the wire.
+    const estimated = Math.max(1, Math.ceil(text.length / 4));
+    yield finishChunk(model, finish ?? 'stop', 0, estimated);
   }
   // Terminate unconditionally: the terminator was swallowed above, and a stream without one is scored
   // "the stream did not end with [DONE]" whether or not the provider supplied its own.
-  yield 'data: [DONE]\n\n';
+  yield DONE_FRAME;
 }
 
-/**
- * Re-frame an anthropic-wire SSE stream (Messages events) as OpenAI Chat Completions chunks.
- *
- * A provider on the anthropic wire answers streamed requests with `content_block_delta` text blocks and
- * reports `message_start.usage.input_tokens` plus `message_delta.usage.output_tokens`. An OpenAI client
- * reading that as chat chunks sees `choices: []` on every frame, so the answer arrives empty: this is the
- * one translation the openai-side dispatch was missing.
- */
 export async function* openAIEventsFromAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  const id = `chatcmpl-${model}`;
-  let buffer = '';
   let finish = 'stop';
   let promptTokens = 0;
   let completionTokens = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let newline = buffer.indexOf('\n');
-      while (newline !== -1) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf('\n');
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '' || payload === '[DONE]') continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-        const event = asRecord(parsed) ?? {};
-        if (event.type === 'message_start') {
-          const usage = asRecord(asRecord(event.message)?.usage) ?? {};
-          if (typeof usage.input_tokens === 'number') promptTokens = usage.input_tokens;
-          continue;
-        }
-        if (event.type === 'content_block_delta') {
-          const delta = asRecord(event.delta) ?? {};
-          if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
-            yield sseEvent(null, {
-              id,
-              object: 'chat.completion.chunk',
-              created: EPOCH,
-              model,
-              choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }],
-            });
-          }
-          continue;
-        }
-        if (event.type === 'message_delta') {
-          const usage = asRecord(event.usage) ?? {};
-          if (typeof usage.output_tokens === 'number') completionTokens = usage.output_tokens;
-          if (typeof event.delta === 'object' && event.delta !== null) {
-            const reason = asRecord(event.delta)?.stop_reason;
-            if (reason === 'max_tokens') finish = 'length';
-            else if (reason === 'tool_use') finish = 'tool_calls';
-          }
-        }
-      }
+  for await (const line of sseLines(upstream)) {
+    const frame = sseFrameOf(line);
+    if (frame.payload === null || frame.done) continue;
+    const event = asRecord(parseFrame(frame.payload));
+    if (event === null) continue;
+    if (event.type === 'message_start') {
+      const usage = asRecord(asRecord(event.message)?.usage) ?? {};
+      if (typeof usage.input_tokens === 'number') promptTokens = usage.input_tokens;
+      continue;
     }
-  } finally {
-    reader.releaseLock();
+    if (event.type === 'content_block_delta') {
+      const delta = asRecord(event.delta) ?? {};
+      if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
+        yield contentChunk(model, delta.text);
+      }
+      continue;
+    }
+    if (event.type === 'message_delta') {
+      const usage = asRecord(event.usage) ?? {};
+      if (typeof usage.output_tokens === 'number') completionTokens = usage.output_tokens;
+      const mapped = finishReasonFromAnthropic(asRecord(event.delta)?.stop_reason);
+      if (mapped !== null) finish = mapped;
+    }
   }
   // The finish chunk carries the stop reason and the counts together, the order an openai client expects.
-  yield sseEvent(null, {
-    id,
-    object: 'chat.completion.chunk',
-    created: EPOCH,
-    model,
-    choices: [{ index: 0, delta: {}, finish_reason: finish }],
-    usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-  });
-  yield 'data: [DONE]\n\n';
+  yield finishChunk(model, finish, promptTokens, completionTokens);
+  yield DONE_FRAME;
 }
 
-/**
- * Re-frame a gemini SSE stream as OpenAI Chat Completions chunks.
- *
- * Gemini streams `data: {...}` frames of the same generateContent object, partial text in
- * `candidates[0].content.parts[0].text`, terminated by a frame with finishReason. The OpenAI shape the
- * client expects is `choices[0].delta.content`, then a final finish_reason and `[DONE]`.
- */
 export async function* openAIEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const id = `chatcmpl-${model}`;
   let finish = 'stop';
-  // Usage cards ride the last frame; kept so the closing chunk can report them like the openai wire does.
+  // Usage rides the last frame; kept so the closing chunk can report the provider's own counts.
   let promptTokens = 0;
   let completionTokens = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let newline = buffer.indexOf('\n');
-      while (newline !== -1) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf('\n');
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '' || payload === '[DONE]') continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-        const meta = geminiMeta(parsed);
-        finish = meta.finish;
-        if (meta.promptTokens > 0) promptTokens = meta.promptTokens;
-        if (meta.completionTokens > 0) completionTokens = meta.completionTokens;
-        const text = geminiText(parsed);
-        if (text !== '') {
-          yield sseEvent(null, {
-            id,
-            object: 'chat.completion.chunk',
-            created: EPOCH,
-            model,
-            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-          });
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
+  for await (const line of sseLines(upstream)) {
+    const frame = sseFrameOf(line);
+    if (frame.payload === null || frame.done) continue;
+    const parsed = parseFrame(frame.payload);
+    const meta = geminiMeta(parsed);
+    finish = meta.finish;
+    if (meta.promptTokens > 0) promptTokens = meta.promptTokens;
+    if (meta.completionTokens > 0) completionTokens = meta.completionTokens;
+    const text = geminiText(parsed);
+    if (text !== '') yield contentChunk(model, text);
   }
-  // A streamed answer still has to report its usage: the client compares the counts the wire reports,
-  // and a stream without them scores the whole request invalid. The finish chunk carries the stop
-  // reason and the usage together, which is the order the openai wire uses with include_usage.
-  yield sseEvent(null, {
-    id,
-    object: 'chat.completion.chunk',
-    created: EPOCH,
-    model,
-    choices: [{ index: 0, delta: {}, finish_reason: finish }],
-    usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-  });
-  yield 'data: [DONE]\n\n';
+  // A streamed answer still has to report its usage: a stream without a closing usage frame scores the
+  // whole request invalid, and the finish chunk is where the openai wire puts it with include_usage.
+  yield finishChunk(model, finish, promptTokens, completionTokens);
+  yield DONE_FRAME;
 }
 
 /** Re-frame any provider stream as Anthropic Messages events. */
